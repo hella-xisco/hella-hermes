@@ -2534,6 +2534,61 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
 
 
+def _scope_reused_tool_call_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Give repeated IDs on later assistant turns their own call/result pair.
+
+    Some providers restart at call_0 for every completion. Those are new
+    calls, not duplicate history. Work only on API copies, with deterministic
+    IDs so appending a turn leaves the already-sent prefix unchanged.
+    Duplicates within one assistant turn retain their ID for the deduper.
+    """
+    used_ids: set = set()
+    current_ids: Dict[str, str] = {}
+    next_id = 1
+    scoped = []
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            in_turn: set = set()
+            calls = []
+            for tc in msg["tool_calls"]:
+                cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                if not cid:
+                    calls.append(tc)
+                    continue
+                if cid not in in_turn:
+                    mapped = cid
+                    if mapped in used_ids:
+                        while f"call_hermes_{next_id}" in used_ids:
+                            next_id += 1
+                        mapped = f"call_hermes_{next_id}"
+                        next_id += 1
+                    current_ids[cid] = mapped
+                    used_ids.add(mapped)
+                    in_turn.add(cid)
+                mapped = current_ids[cid]
+                if mapped != cid:
+                    tc = copy.copy(tc)
+                    updates = {"id": mapped}
+                    for field, value in (("call_id", mapped),
+                                         ("response_item_id", f"fc_{mapped[5:]}")):
+                        if (field in tc if isinstance(tc, dict) else hasattr(tc, field)):
+                            updates[field] = value
+                    if isinstance(tc, dict):
+                        tc.update(updates)
+                    else:
+                        for field, value in updates.items():
+                            setattr(tc, field, value)
+                calls.append(tc)
+            msg = {**msg, "tool_calls": calls}
+        elif msg.get("role") == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            mapped = current_ids.get(cid, cid)
+            if mapped != cid:
+                msg = {**msg, "tool_call_id": mapped}
+        scoped.append(msg)
+    return scoped
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -2636,6 +2691,9 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     pass
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
+
+    # Scope provider-reused IDs before orphan detection and deduplication.
+    messages = _scope_reused_tool_call_ids(messages)
 
     surviving_call_ids: set = set()
     for msg in messages:
